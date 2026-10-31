@@ -24,25 +24,27 @@ RECOGNITION_PROMPT = (
     '예: [{"name": "계란", "quantity": 6, "unit": "개"}, {"name": "우유", "quantity": 1, "unit": "개"}]'
 )
 
-# 오픈라우터 무료 모델 목록 조회 자체가 실패할 경우를 위한 최소 안전망 (2026-08-27 동작 확인).
+# 오픈라우터 무료 모델 목록 조회 자체가 실패할 경우를 위한 최소 안전망 (2026-10-31 동작 확인).
 SAFETY_NET_VISION_MODELS = [
-    "minimax/minimax-m3:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "dots-studio/dots-3-note-preview:free",
 ]
 _EXCLUDE_KEYWORDS = ["safety", "rerank", "guard"]
 
-# 2026-08-27 냉장고 사진으로 실측한 우선순위. 앞쪽일수록 먼저 시도한다.
+# 2026-10-31 냉장고 사진으로 다시 실측한 우선순위. 앞쪽일수록 먼저 시도한다.
+# minimax-m3는 2026-10-22 무료 목록에서 빠졌다.
 # 무료 모델은 응답 자체가 거부되는 경우가 잦아, 성공률을 인식 정확도보다 앞에 둔다.
-#   minimax-m3        성공 3/3, 품목 7/7, 개수 4.7/7, 4초
-#   gemma-4-26b       성공 2/13, 품목 7/7, 개수 7.0/7, 6초
-#   gemma-4-31b       성공 1/13, 품목 7/7, 개수 6.0/7, 9초
+#   nemotron-3.5-super-vl  성공 3/3, 품목 7/7, 19~52초
+#   dots-3-note-preview    성공 2/3, 품목 7/7, 52~71초 (실패 1회는 10분 뒤 빈 응답)
+#   gemma-4-26b            성공 0/3, 429 (2026-08-27에는 성공 2/13, 개수 7.0/7)
+#   gemma-4-31b            성공 0/3, 429 (2026-08-27에는 성공 1/13, 개수 6.0/7)
 # 목록에 없는 모델은 이 뒤에 무작위 순서로 붙는다 (새로 등장한 무료 모델도 기회를 얻도록).
 PREFERRED_VISION_MODELS = [
-    "minimax/minimax-m3:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "dots-studio/dots-3-note-preview:free",
     "google/gemma-4-26b-a4b-it:free",
     "google/gemma-4-31b-it:free",
 ]
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_models_payload():

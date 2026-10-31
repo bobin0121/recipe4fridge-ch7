@@ -14,27 +14,26 @@ DIFFICULTY_OPTIONS = ["상관없음", "초급", "중급", "고급"]
 TIME_OPTIONS = ["상관없음", "15분 이내", "30분 이내", "30분 이상"]
 SERVINGS_OPTIONS = ["상관없음", "1인분", "2인분", "3인분", "4인분"]
 
-# 오픈라우터 무료 모델 목록 조회 자체가 실패할 경우를 위한 최소 안전망 (2026-08-27 동작 확인).
+# 오픈라우터 무료 모델 목록 조회 자체가 실패할 경우를 위한 최소 안전망 (2026-10-31 동작 확인).
 SAFETY_NET_RECIPE_MODELS = [
-    "minimax/minimax-m3:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "cohere/north-mini-code:free",
 ]
 _EXCLUDE_KEYWORDS = ["safety", "rerank", "guard"]
 
-# 2026-08-27 재료 7종으로 무료 모델 16종을 실측한 우선순위. 앞쪽일수록 먼저 시도한다.
+# 2026-10-31 재료 7종으로 다시 실측한 우선순위. 앞쪽일수록 먼저 시도한다.
+# minimax-m3(2026-10-22)와 nemotron-3-super(2026-10-30)는 무료 목록에서 빠졌다.
 # 이미지 입력 모델도 텍스트 전용 프롬프트에 정상 응답하므로 후보에서 제외하지 않는다.
-#   minimax-m3         성공 3/3, 레시피 3개, 조리 3.9단계, 18초.
-#                      계정 일일 무료 한도(50회) 소진 상태에서도 상당수 응답함
-#                      (다른 모델은 같은 조건에서 전부 즉시 429). 다만 면제는 아님
-#   nemotron-3-super   성공 3/3, 레시피 3개, 조리 5.0단계, 44초. 조리 순서가 가장 상세
-#   north-mini-code    성공 3/3, 레시피 3개, 조리 3.6단계, 22초
+#   nemotron-3.5-super-vl  성공 2/2, 레시피 3개, 조리 3.8단계, 10~15초. 가장 빠름
+#   nemotron-3-ultra       성공 2/2, 레시피 3개, 조리 5.5단계, 25~39초. 조리 순서가 가장 상세
+#                          (2026-10-16 녹화 중 5분 넘게 응답하지 않은 적이 있어 2순위에 둠)
+#   north-mini-code        성공 2/2, 레시피 3개, 조리 3.0단계, 15~62초
 # 목록에 없는 모델은 이 뒤에 무작위 순서로 붙는다 (새로 등장한 무료 모델도 기회를 얻도록).
 PREFERRED_RECIPE_MODELS = [
-    "minimax/minimax-m3:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
     "cohere/north-mini-code:free",
 ]
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_models_payload():
