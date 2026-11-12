@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 import db
 from auth_ui import current_user, render_sidebar_auth
+from openrouter import PERMANENT_ERROR_STATUSES, extract_content
 from recipe import (
     CUISINE_OPTIONS,
     DIFFICULTY_OPTIONS,
@@ -91,7 +92,8 @@ def _format_reset_time(reset_ms):
     """
     try:
         moment = datetime.fromtimestamp(int(reset_ms) / 1000, ZoneInfo("Asia/Seoul"))
-    except (TypeError, ValueError, OSError, OverflowError):
+    # 시간대 데이터(tzdata)가 없으면 ZoneInfoNotFoundError(KeyError의 하위 클래스)가 난다.
+    except (TypeError, ValueError, OSError, OverflowError, KeyError):
         return "잠시 후"
     half = "오전" if moment.hour < 12 else "오후"
     hour = moment.hour % 12 or 12
@@ -330,19 +332,20 @@ if wizard_step == 1:
                 if response.status_code == 429:
                     st.session_state.recognition_error = rate_limit_message(response, "식재료 인식")
                     st.session_state.recognition_error_detail = response.text
+                elif response.status_code in PERMANENT_ERROR_STATUSES:
+                    st.session_state.recognition_error = f"❌ 식재료 인식 실패: API 키나 크레딧을 확인해 주세요 (status {response.status_code})."
+                    st.session_state.recognition_error_detail = response.text
                 elif response.status_code >= 500:
                     st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 제공자 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
                 elif response.status_code != 200:
                     st.session_state.recognition_error = f"❌ 식재료 인식 실패: 요청이 실패했습니다 (status {response.status_code})."
                     st.session_state.recognition_error_detail = response.text
                 else:
-                    body = response.json()
-                    choices = body.get("choices")
-                    if not choices:
-                        st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 응답 형식이 올바르지 않습니다 (choices 없음). 잠시 후 다시 시도해주세요."
+                    content = extract_content(response)
+                    if content is None:
+                        st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 응답 형식이 올바르지 않습니다 (응답 내용 없음). 잠시 후 다시 시도해주세요."
                         st.session_state.recognition_error_detail = response.text
                     else:
-                        content = choices[0]["message"]["content"]
                         ingredients = parse_ingredients(content)
                         if ingredients is None:
                             st.session_state.recognition_error = "❌ 식재료 인식 실패: 서로 다른 모델 3차 시도 모두 응답을 재료 목록으로 변환하지 못했습니다."
@@ -502,6 +505,12 @@ elif wizard_step == 3:
                 st.error(rate_limit_message(response, "레시피 생성"))
                 with st.expander("자세히 보기 (기술 정보)"):
                     st.code(response.text)
+            elif response.status_code in PERMANENT_ERROR_STATUSES:
+                st.session_state.pop("recipes", None)
+                st.session_state.pop("selected_recipe", None)
+                st.error(f"❌ 레시피 생성 실패: API 키나 크레딧을 확인해 주세요 (status {response.status_code}).")
+                with st.expander("자세히 보기 (기술 정보)"):
+                    st.code(response.text)
             elif response.status_code >= 500:
                 st.session_state.pop("recipes", None)
                 st.session_state.pop("selected_recipe", None)
@@ -513,16 +522,14 @@ elif wizard_step == 3:
                 with st.expander("자세히 보기 (기술 정보)"):
                     st.code(response.text)
             else:
-                body = response.json()
-                choices = body.get("choices")
-                if not choices:
+                content = extract_content(response)
+                if content is None:
                     st.session_state.pop("recipes", None)
                     st.session_state.pop("selected_recipe", None)
-                    st.error("❌ 레시피 생성 실패: 모델 응답 형식이 올바르지 않습니다 (choices 없음). 잠시 후 다시 시도해주세요.")
+                    st.error("❌ 레시피 생성 실패: 모델 응답 형식이 올바르지 않습니다 (응답 내용 없음). 잠시 후 다시 시도해주세요.")
                     with st.expander("자세히 보기 (기술 정보)"):
                         st.code(response.text)
                 else:
-                    content = choices[0]["message"]["content"]
                     recipes = parse_recipes(content)
                     if not recipes:
                         st.session_state.pop("recipes", None)
