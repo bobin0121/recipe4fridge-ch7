@@ -1,17 +1,13 @@
 import base64
 import io
 import json
-import random
 import re
-import time
 import uuid
 
-import requests
-import streamlit as st
 from PIL import Image
 
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODELS_URL = "https://openrouter.ai/api/v1/models"
+import openrouter
+
 MAX_IMAGE_DIMENSION = 1024
 UNIT_OPTIONS = ["개", "병", "봉지", "팩", "단", "g", "kg", "ml", "L", "기타"]
 RECOGNITION_PROMPT = (
@@ -29,7 +25,6 @@ SAFETY_NET_VISION_MODELS = [
     "nvidia/nemotron-3.5-super-vl:free",
     "dots-studio/dots-3-note-preview:free",
 ]
-_EXCLUDE_KEYWORDS = ["safety", "rerank", "guard"]
 
 # 2026-10-31 냉장고 사진으로 다시 실측한 우선순위. 앞쪽일수록 먼저 시도한다.
 # minimax-m3는 2026-10-22 무료 목록에서 빠졌다.
@@ -46,81 +41,20 @@ PREFERRED_VISION_MODELS = [
     "google/gemma-4-31b-it:free",
 ]
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _fetch_models_payload():
-    """오픈라우터 모델 목록 원본을 5분간 캐시한다.
-
-    실패하면 예외를 그대로 올려서 실패 결과가 캐시에 남지 않게 한다
-    (일시적인 네트워크 오류가 5분 동안 굳어지지 않도록).
-    """
-    response = requests.get(MODELS_URL, timeout=10)
-    response.raise_for_status()
-    return response.json().get("data", [])
-
-
-def _fetch_free_vision_model_entries():
-    """오픈라우터에서 현재 사용 가능한 무료 비전(이미지 입력) 모델의 원본 정보를 조회한다.
-
-    무료 모델 라인업은 시간에 따라 계속 바뀌므로 5분 TTL로 다시 조회한다.
-    조회 자체가 실패하면 빈 리스트를 반환한다 (호출부에서 안전망으로 대체).
-    """
-    try:
-        data = _fetch_models_payload()
-    except (requests.exceptions.RequestException, ValueError):
-        return []
-
-    entries = []
-    for m in data:
-        model_id = m.get("id", "")
-        if not model_id.endswith(":free"):
-            continue
-        if any(keyword in model_id.lower() for keyword in _EXCLUDE_KEYWORDS):
-            continue
-        modality = m.get("architecture", {}).get("input_modalities", [])
-        if "image" in modality:
-            entries.append(m)
-    return entries
-
-
 def list_free_vision_models(allowed_models=None):
     """현재 사용 가능한 무료 비전 모델 id 목록. allowed_models가 주어지면 그 안에서만 고른다.
 
     allowed_models로 걸러낸 결과가 비어있으면(예: 사용자가 골라둔 모델이 전부 목록에서
     사라진 경우) 안전하게 전체 목록으로 되돌아간다.
     """
-    entries = _fetch_free_vision_model_entries()
+    entries = openrouter.fetch_free_model_entries(require_image=True)
     models = [m.get("id", "") for m in entries] or list(SAFETY_NET_VISION_MODELS)
-    if allowed_models:
-        filtered = [m for m in models if m in allowed_models]
-        if filtered:
-            return filtered
-    return models
-
-
-def prioritize_models(pool):
-    """실측 우선순위(PREFERRED_VISION_MODELS) 순서로 후보를 정렬한다.
-
-    우선순위 목록에 없는 모델은 뒤쪽에 무작위 순서로 배치한다. 무료 모델 라인업은
-    수시로 바뀌므로, 아직 실측하지 않은 새 모델도 뒤에서는 시도될 수 있게 남겨둔다.
-    """
-    ranked = [m for m in PREFERRED_VISION_MODELS if m in pool]
-    rest = [m for m in pool if m not in ranked]
-    random.shuffle(rest)
-    return ranked + rest
+    return openrouter.filter_allowed(models, allowed_models)
 
 
 def list_free_vision_models_detailed():
     """프로필 화면의 모델 선택 UI에 쓸 상세 정보(id/name/context_length/created)를 반환."""
-    entries = _fetch_free_vision_model_entries()
-    return [
-        {
-            "id": m.get("id", ""),
-            "name": m.get("name") or m.get("id", ""),
-            "context_length": m.get("context_length"),
-            "created": m.get("created"),
-        }
-        for m in entries
-    ]
+    return openrouter.model_details(openrouter.fetch_free_model_entries(require_image=True))
 
 
 def to_resized_data_uri(file_like):
@@ -135,22 +69,18 @@ def to_resized_data_uri(file_like):
 
 
 def call_vision_model(model, data_uri, api_key):
-    return requests.post(
-        API_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": RECOGNITION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                    ],
-                }
-            ],
-        },
-        timeout=60,
+    return openrouter.post_chat(
+        model,
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": RECOGNITION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ],
+        api_key,
     )
 
 
@@ -158,41 +88,23 @@ def recognize_ingredients(data_uri, api_key, on_attempt=None, attempts=3, allowe
     """매 시도마다 오픈라우터의 현재 무료 비전 모델 중 서로 다른 모델을 순서대로 시도한다.
 
     실측 우선순위(PREFERRED_VISION_MODELS)가 앞에 오고, 아직 실측하지 않은 모델이
-    무작위 순서로 뒤를 잇는다. 429(요청 폭주)든 JSON 파싱 실패든 실패로 간주하고,
-    성공(재료 목록을 얻을 때)할 때까지 또는 attempts 횟수만큼 다음 모델로 넘어간다.
+    무작위 순서로 뒤를 잇는다. 429(요청 폭주), 시간 초과, 빈 응답, JSON 파싱 실패 모두 실패로
+    간주하고, 성공(재료 목록을 얻을 때)할 때까지 또는 attempts 횟수만큼 다음 모델로 넘어간다.
     고정된 "폴백 모델" 개념 대신, 매 시도 자체가 서로 다른 모델이라 폴백 역할을 겸한다.
 
     on_attempt: 선택적 콜백. (label, model) 을 인자로 호출되어 진행 상황을 UI에 전달할 수 있다.
     allowed_models: 사용자가 프로필에서 선택한 모델 id 목록. 없으면 전체 무료 모델을 대상으로 한다.
     """
-    pool = prioritize_models(list_free_vision_models(allowed_models=allowed_models))
-    if pool:
-        # 풀이 attempts보다 적으면(예: 사용자가 모델을 1~2개만 선택한 경우) 안전망 모델로
-        # 채우지 않고 풀 안에서 순환한다 - 사용자가 고르지 않은 모델을 몰래 끼워넣지 않기 위함.
-        models = [pool[i % len(pool)] for i in range(attempts)]
-    else:
-        models = [random.choice(SAFETY_NET_VISION_MODELS) for _ in range(attempts)]
-
-    response = None
-    used_model = models[0]
-    for i, model in enumerate(models):
-        label = f"{i + 1}차 시도"
-        if on_attempt is not None:
-            on_attempt(label, model)
-        response = call_vision_model(model, data_uri, api_key)
-        used_model = model
-        if response.status_code == 200:
-            try:
-                body = response.json()
-                choices = body.get("choices")
-                if choices and parse_ingredients(choices[0]["message"]["content"]) is not None:
-                    break
-            except ValueError:
-                pass
-        if i < len(models) - 1:
-            # 429는 모델별 순간 혼잡이라 1초로는 잘 풀리지 않는다. 시도마다 대기를 늘린다.
-            time.sleep(2 * (i + 1))
-    return response, used_model
+    pool = openrouter.prioritize_models(
+        list_free_vision_models(allowed_models=allowed_models), PREFERRED_VISION_MODELS
+    )
+    models = openrouter.plan_attempts(pool, SAFETY_NET_VISION_MODELS, attempts)
+    return openrouter.call_with_fallback(
+        models,
+        lambda model: call_vision_model(model, data_uri, api_key),
+        lambda response: parse_ingredients(openrouter.extract_content(response)) is not None,
+        on_attempt=on_attempt,
+    )
 
 
 def merge_duplicate_ingredients(ingredients):
@@ -219,6 +131,8 @@ def parse_ingredients(content):
     수량 1, 단위 "개"로 채워 동일한 형태로 반환한다 (하위 호환).
     동일한 이름의 재료가 중복 인식된 경우 수량을 합쳐 하나로 정리한다.
     """
+    if not isinstance(content, str):
+        return None
     match = re.search(r"\[.*\]", content, re.DOTALL)
     if not match:
         return None
