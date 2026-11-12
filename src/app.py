@@ -1,3 +1,4 @@
+import html
 import os
 import time
 import uuid
@@ -7,15 +8,17 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from PIL import Image
 
 import db
 from auth_ui import current_user, render_sidebar_auth
-from openrouter import PERMANENT_ERROR_STATUSES, extract_content
+from openrouter import MODEL_TOTAL_TIMEOUT_SECONDS, PERMANENT_ERROR_STATUSES, extract_content
 from recipe import (
     CUISINE_OPTIONS,
     DIFFICULTY_OPTIONS,
     SERVINGS_OPTIONS,
     TIME_OPTIONS,
+    _is_korean_enough,
     generate_recipes,
     parse_recipes,
 )
@@ -46,6 +49,8 @@ RESET_STATE_KEYS = [
     "used_recipe_model",
     "recipes",
     "selected_recipe",
+    "recipe_error",
+    "recipe_error_detail",
     "last_recipe_request_time",
     "recipe_cuisine",
     "recipe_difficulty",
@@ -71,7 +76,7 @@ def rate_limit_message(response, action):
     )
     if not is_daily:
         return (
-            f"❌ {action} 실패: 무료 모델 3곳이 모두 혼잡합니다 (429). "
+            f"❌ {action} 실패: 지금 무료 AI 모델에 요청이 몰려 응답을 받지 못했습니다 (429). "
             "1~2분 뒤에 다시 시도해 주세요."
         )
 
@@ -98,6 +103,66 @@ def _format_reset_time(reset_ms):
     half = "오전" if moment.hour < 12 else "오후"
     hour = moment.hour % 12 or 12
     return f"{moment.month}월 {moment.day}일 {half} {hour}시에"
+
+
+# 기다릴 시간 안내. 2026-10-31 실측: 사진 인식 19~71초, 레시피 생성 10~62초.
+# 한 모델이 MODEL_TOTAL_TIMEOUT_SECONDS 안에 끝내지 못하면 다음 모델로 넘어가므로 최악에는 몇 분이 걸린다.
+VISION_WAIT_NOTICE = "보통 20초~1분 걸리고, 붐빌 때는 5분 가까이 걸릴 수 있어요."
+RECIPE_WAIT_NOTICE = "보통 10초~1분 걸리고, 붐빌 때는 5분 가까이 걸릴 수 있어요."
+RETRY_NOTICE = (
+    f"한 모델이 {MODEL_TOTAL_TIMEOUT_SECONDS}초 안에 답하지 않으면 다른 모델로 바꿔 다시 시도합니다. "
+    "이 화면을 닫거나 새로 고치지 말고 기다려 주세요."
+)
+BAD_IMAGE_MESSAGE = (
+    "❌ 사진 파일을 열 수 없습니다. 파일이 손상되었거나 JPG, PNG 사진이 아닐 수 있어요. "
+    "다른 사진을 올리거나, 사진 앱에서 다시 저장한 뒤 올려 주세요."
+)
+TIMEOUT_MESSAGE = (
+    "❌ {action} 실패: AI 모델이 제시간에 답하지 않았습니다. 무료 모델이 붐비는 때일 수 있어요. "
+    "잠시 후 다시 시도해 주세요."
+)
+NETWORK_MESSAGE = "❌ {action} 실패: AI 서비스에 연결하지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도해 주세요."
+EMPTY_RESPONSE_MESSAGE = "❌ {action} 실패: AI 모델이 빈 응답을 보냈습니다. 잠시 후 다시 시도해 주세요."
+
+
+def http_failure_message(response, action):
+    """200이 아닌 응답을 원인별 안내 문구와 기술 정보(없으면 None)로 바꾼다."""
+    status = response.status_code
+    if status == 429:
+        return rate_limit_message(response, action), response.text
+    if status in PERMANENT_ERROR_STATUSES:
+        return (
+            f"❌ {action} 실패: AI 서비스의 API 키나 크레딧에 문제가 있어 요청이 거절되었습니다 (status {status}). "
+            "다시 시도해도 같은 오류가 나니 키와 크레딧을 확인해 주세요.",
+            response.text,
+        )
+    if status >= 500:
+        return f"❌ {action} 실패: AI 모델 서버에 일시적인 오류가 났습니다. 잠시 후 다시 시도해 주세요.", None
+    return f"❌ {action} 실패: 요청이 처리되지 않았습니다 (status {status}). 잠시 후 다시 시도해 주세요.", response.text
+
+
+def show_error(message, detail=None):
+    st.error(message)
+    if detail:
+        with st.expander("자세히 보기 (기술 정보)"):
+            st.code(detail)
+
+
+def is_readable_image(uploaded_file):
+    """사진 파일을 실제로 열 수 있는지 미리 확인한다 (확장자만 png이고 내용이 깨진 파일 등)."""
+    try:
+        with Image.open(uploaded_file) as image:
+            image.verify()
+        return True
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+        return False
+    finally:
+        uploaded_file.seek(0)
+
+
+def cook_time_text(minutes):
+    """조리 시간 문구. 값이 없으면 "약 None분" 대신 정보가 없다고 쓴다."""
+    return f"⏱ 약 {minutes}분" if minutes is not None else "⏱ 조리 시간 정보 없음"
 
 
 def get_api_key():
@@ -133,6 +198,13 @@ def render_ingredient_editor():
     if not ingredients:
         st.info("아직 목록이 비어 있습니다. 아래에서 직접 추가해주세요.")
 
+    # 칸 폭에 따라 한 줄 또는 두 줄로 배치한다 (아래 CSS의 .st-key-ingredient_editor).
+    with st.container(key="ingredient_editor"):
+        _render_ingredient_rows(ingredients)
+    st.session_state.ingredients = merge_duplicate_ingredients(ingredients)
+
+
+def _render_ingredient_rows(ingredients):
     delete_index = None
     for i, item in enumerate(ingredients):
         item.setdefault("unit", "개")
@@ -163,7 +235,11 @@ def render_ingredient_editor():
         item["unit"] = col_unit.selectbox(
             "단위", UNIT_OPTIONS, index=unit_index, key=f"ingredient_unit_{item_id}", label_visibility="collapsed"
         )
-        if col_delete.button("삭제", key=f"delete_{item_id}"):
+        # 좁은 칸에서도 잘리지 않게 휴지통 아이콘만 보인다. 글자("○○ 삭제")는 CSS로 숨겨
+        # 화면 낭독기가 어느 재료의 삭제 단추인지 읽을 수 있게 한다.
+        if col_delete.button(
+            f"{item['name']} 삭제", key=f"delete_{item_id}", icon=":material/delete:", help="이 재료를 목록에서 뺍니다."
+        ):
             delete_index = i
     if delete_index is not None:
         ingredients.pop(delete_index)
@@ -171,7 +247,7 @@ def render_ingredient_editor():
 
     with st.form("add_ingredient_form", clear_on_submit=True):
         col_name, col_qty, col_unit, col_add = st.columns([2.5, 2, 1.5, 1.2])
-        new_name = col_name.text_input("재료 이름", label_visibility="collapsed", placeholder="재료 이름")
+        new_name = col_name.text_input("재료 이름", label_visibility="collapsed", placeholder="추가할 재료 이름")
         new_qty = col_qty.number_input("수량", min_value=0, step=1, value=1, label_visibility="collapsed")
         new_unit = col_unit.selectbox("단위", UNIT_OPTIONS, label_visibility="collapsed")
         submitted = col_add.form_submit_button("추가")
@@ -190,8 +266,6 @@ def render_ingredient_editor():
                     {"_id": uuid.uuid4().hex, "name": new_name_clean, "quantity": str(new_qty), "unit": new_unit}
                 )
             st.rerun()
-
-    st.session_state.ingredients = merge_duplicate_ingredients(ingredients)
 
 
 st.set_page_config(page_title="냉장고 식재료 인식", page_icon="🥬", layout="wide")
@@ -226,6 +300,116 @@ st.markdown(
     [data-testid="stImage"] img {
         max-width: 700px !important;
     }
+
+    /* ---- 좁은 화면 배치 ----
+       st.columns는 비율대로만 줄어들어, 폭 550~800px이나 사이드바가 열린 화면에서는 칸이
+       지나치게 좁아져 단위 칸이 비어 보이고 삭제 단추 글자가 잘렸다. 아래 규칙은 칸마다
+       최소 폭을 주고, 자리가 모자라면 다음 줄로 내린다. 각 묶음은 st.container(key=...)로 감쌌다. */
+    .st-key-page_header > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"],
+    .st-key-step_layout > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"],
+    .st-key-recipe_detail_header > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"],
+    .st-key-ingredient_editor [data-testid="stHorizontalBlock"],
+    .st-key-recipe_options [data-testid="stHorizontalBlock"],
+    .st-key-recipe_cards [data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap;
+    }
+    /* 제목 옆 단추('처음부터', '목록으로')는 글자 폭만큼 차지하고, 모자라면 제목 아래로 내려간다. */
+    .st-key-page_header [data-testid="stColumn"]:first-child,
+    .st-key-recipe_detail_header [data-testid="stColumn"]:first-child {
+        flex: 1 1 14rem !important;
+        min-width: 0 !important;
+    }
+    .st-key-page_header [data-testid="stColumn"]:last-child,
+    .st-key-recipe_detail_header [data-testid="stColumn"]:last-child {
+        flex: 0 0 auto !important;
+        width: auto !important;
+        min-width: 0 !important;
+    }
+    /* 2단계(사진 | 식재료), 3단계(식재료 | 레시피): 두 칸이 각각 22rem보다 좁아지면 위아래로 쌓는다. */
+    .st-key-step_layout > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+        flex: 1 1 22rem !important;
+        min-width: min(22rem, 100%) !important;
+    }
+    /* ② 식재료 확인 표: 넓으면 [이름 | 수량 | 단위 | 삭제] 한 줄, 좁으면 이름을 윗줄에 두고
+       [수량 | 단위 | 삭제]를 아랫줄에 둔다. 아주 좁으면 단위와 삭제가 한 줄 더 내려간다. */
+    .st-key-ingredient_editor {
+        container-type: inline-size;
+    }
+    .st-key-ingredient_editor [data-testid="stHorizontalBlock"] {
+        row-gap: 0.5rem;
+    }
+    .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(1) {
+        flex: 1 1 8rem !important;
+        min-width: 8rem !important;
+    }
+    .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(2) {
+        flex: 0 0 9.5rem !important;
+        min-width: 9.5rem !important;
+    }
+    .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(3) {
+        flex: 0 0 6.5rem !important;
+        min-width: 6.5rem !important;
+    }
+    .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(4) {
+        flex: 0 0 auto !important;
+        width: auto !important;
+        min-width: 0 !important;
+    }
+    @container (max-width: 32rem) {
+        .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(1) {
+            flex: 1 1 100% !important;
+        }
+        .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(2) {
+            flex: 1 1 9.5rem !important;
+        }
+        .st-key-ingredient_editor [data-testid="stColumn"]:nth-child(3) {
+            flex: 1 1 6.5rem !important;
+        }
+        /* 줄이 둘로 나뉘면 재료끼리 구분되도록 아래에 옅은 선을 긋는다 (추가 폼은 테두리가 있어 제외). */
+        .st-key-ingredient_editor > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+        }
+    }
+    /* 삭제 단추는 휴지통 아이콘만 보이고, "○○ 삭제" 글자는 화면 낭독기만 읽는다. */
+    .st-key-ingredient_editor [class*="st-key-delete_"] button {
+        min-width: 44px;
+    }
+    .st-key-ingredient_editor [class*="st-key-delete_"] [data-testid="stMarkdownContainer"] {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden !important;
+        clip-path: inset(50%) !important;
+        white-space: nowrap !important;
+    }
+    /* ③ 레시피 조건 선택 4칸: 좁으면 2칸씩 두 줄로 놓는다. */
+    .st-key-recipe_options {
+        container-type: inline-size;
+    }
+    .st-key-recipe_options [data-testid="stColumn"] {
+        flex: 1 1 0 !important;
+        min-width: 0 !important;
+    }
+    @container (max-width: 36rem) {
+        .st-key-recipe_options [data-testid="stColumn"] {
+            flex: 1 1 calc(50% - 0.5rem) !important;
+            min-width: calc(50% - 0.5rem) !important;
+        }
+    }
+    /* 레시피 카드: 한 장이 10rem보다 좁아지면 위아래로 쌓고, 고정 높이를 풀어 빈 공간을 없앤다. */
+    .st-key-recipe_cards {
+        container-type: inline-size;
+    }
+    @container (max-width: 32rem) {
+        .st-key-recipe_cards [data-testid="stColumn"] {
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+        .st-key-recipe_cards [data-testid="stColumn"] [height="260px"] {
+            height: auto !important;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -242,7 +426,8 @@ def _do_restart():
     st.rerun()
 
 
-header_col, restart_col = st.columns([5, 1])
+with st.container(key="page_header"):
+    header_col, restart_col = st.columns([5, 1])
 header_col.title("🥬 냉장고 레시피 추천")
 with restart_col:
     has_progress = st.session_state.wizard_step > 1 or bool(st.session_state.get("ingredients"))
@@ -288,14 +473,22 @@ if wizard_step == 1:
         if uploaded_file.size > MAX_UPLOAD_BYTES:
             st.error("이미지 용량이 10MB를 초과합니다. 더 작은 이미지를 업로드해주세요.")
             st.stop()
+        if not is_readable_image(uploaded_file):
+            st.error(BAD_IMAGE_MESSAGE)
+            st.stop()
 
-        photo_col, recognize_col = st.columns(2)
+        with st.container(key="step_layout"):
+            photo_col, recognize_col = st.columns(2)
 
         with photo_col:
             st.image(uploaded_file, caption="업로드한 사진", use_container_width=True)
 
         with recognize_col:
-            if st.button("식재료 인식하기", type="primary"):
+            # 오류 안내는 단추 위에 보이게 하되, 다시 시도하는 동안에는 이전 오류를 그리지 않는다.
+            error_slot = st.container()
+            has_error = bool(st.session_state.get("recognition_error"))
+            clicked = st.button("다시 인식하기" if has_error else "식재료 인식하기", type="primary")
+            if clicked:
                 st.session_state.pop("recognition_error", None)
                 st.session_state.pop("recognition_error_detail", None)
                 st.session_state.pop("ingredients", None)
@@ -304,65 +497,65 @@ if wizard_step == 1:
                 st.session_state.uploaded_photo_bytes = uploaded_file.getvalue()
                 st.session_state.uploaded_photo_name = uploaded_file.name
 
-                with st.status("사진을 분석하는 중입니다...", expanded=True) as status:
-                    data_uri, resized_bytes = to_resized_data_uri(uploaded_file)
-                    status.write(
-                        f"이미지 축소: {uploaded_file.size // 1024}KB → {resized_bytes // 1024}KB "
-                        f"(긴 변 {MAX_IMAGE_DIMENSION}px 이하)"
-                    )
+                error, detail, response = None, None, None
+                with st.status(f"사진을 분석하는 중입니다. {VISION_WAIT_NOTICE}", expanded=True) as status:
+                    status.write(RETRY_NOTICE)
                     try:
-                        response, used_model = recognize_ingredients(
-                            data_uri,
-                            api_key,
-                            on_attempt=lambda label, model: status.write(f"{label}: `{model}` 호출 중..."),
-                            allowed_models=get_allowed_models("selected_vision_models"),
+                        data_uri, resized_bytes = to_resized_data_uri(uploaded_file)
+                    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+                        data_uri = None
+                        error = BAD_IMAGE_MESSAGE
+                    if data_uri is not None:
+                        status.write(
+                            f"이미지 축소: {uploaded_file.size // 1024}KB → {resized_bytes // 1024}KB "
+                            f"(긴 변 {MAX_IMAGE_DIMENSION}px 이하)"
                         )
-                    except requests.exceptions.Timeout:
+                        try:
+                            response, used_model = recognize_ingredients(
+                                data_uri,
+                                api_key,
+                                on_attempt=lambda label, model: status.write(f"{label}: `{model}` 호출 중..."),
+                                allowed_models=get_allowed_models("selected_vision_models"),
+                            )
+                        except requests.exceptions.Timeout:
+                            error = TIMEOUT_MESSAGE.format(action="식재료 인식")
+                        except requests.exceptions.RequestException as e:
+                            error, detail = NETWORK_MESSAGE.format(action="식재료 인식"), str(e)
+                    if response is None:
                         status.update(label="분석 실패", state="error")
-                        st.session_state.recognition_error = "❌ 식재료 인식 실패: 요청이 시간 초과되었습니다. 잠시 후 다시 시도해주세요."
-                        st.rerun()
-                    except requests.exceptions.RequestException as e:
-                        status.update(label="분석 실패", state="error")
-                        st.session_state.recognition_error = f"❌ 식재료 인식 실패: 네트워크 오류가 발생했습니다: {e}"
-                        st.rerun()
-                    status.update(label="분석 완료", state="complete")
-
-                st.session_state.used_vision_model = used_model
-
-                if response.status_code == 429:
-                    st.session_state.recognition_error = rate_limit_message(response, "식재료 인식")
-                    st.session_state.recognition_error_detail = response.text
-                elif response.status_code in PERMANENT_ERROR_STATUSES:
-                    st.session_state.recognition_error = f"❌ 식재료 인식 실패: API 키나 크레딧을 확인해 주세요 (status {response.status_code})."
-                    st.session_state.recognition_error_detail = response.text
-                elif response.status_code >= 500:
-                    st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 제공자 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
-                elif response.status_code != 200:
-                    st.session_state.recognition_error = f"❌ 식재료 인식 실패: 요청이 실패했습니다 (status {response.status_code})."
-                    st.session_state.recognition_error_detail = response.text
-                else:
-                    content = extract_content(response)
-                    if content is None:
-                        st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 응답 형식이 올바르지 않습니다 (응답 내용 없음). 잠시 후 다시 시도해주세요."
-                        st.session_state.recognition_error_detail = response.text
                     else:
-                        ingredients = parse_ingredients(content)
-                        if ingredients is None:
-                            st.session_state.recognition_error = "❌ 식재료 인식 실패: 서로 다른 모델 3차 시도 모두 응답을 재료 목록으로 변환하지 못했습니다."
-                            st.session_state.recognition_error_detail = content
+                        status.update(label="분석 완료", state="complete")
+
+                if response is not None:
+                    st.session_state.used_vision_model = used_model
+                    if response.status_code != 200:
+                        error, detail = http_failure_message(response, "식재료 인식")
+                    else:
+                        content = extract_content(response)
+                        ingredients = parse_ingredients(content) if content is not None else None
+                        if content is None:
+                            error, detail = EMPTY_RESPONSE_MESSAGE.format(action="식재료 인식"), response.text
+                        elif ingredients is None:
+                            error = (
+                                "❌ 식재료 인식 실패: AI 응답에서 식재료 목록을 찾지 못했습니다. "
+                                "냉장고 안이 밝고 선명하게 보이는 사진으로 다시 시도하거나, 재료를 직접 입력해 주세요."
+                            )
+                            detail = content
                         else:
                             st.session_state.ingredients = ingredients
                             st.session_state.wizard_step = 2
+                if error:
+                    st.session_state.recognition_error = error
+                    st.session_state.recognition_error_detail = detail
                 st.rerun()
+            st.caption(f"⏱ 인식에는 {VISION_WAIT_NOTICE}")
 
             if st.session_state.get("used_vision_model"):
                 st.caption(f"실제 응답 모델: `{st.session_state.used_vision_model}`")
 
-            if st.session_state.get("recognition_error"):
-                st.error(st.session_state.recognition_error)
-                if st.session_state.get("recognition_error_detail"):
-                    with st.expander("자세히 보기 (기술 정보)"):
-                        st.code(st.session_state.recognition_error_detail)
+            if has_error:
+                with error_slot:
+                    show_error(st.session_state.recognition_error, st.session_state.get("recognition_error_detail"))
                 if st.button("재료를 직접 입력할게요"):
                     st.session_state.ingredients = []
                     st.session_state.pop("recognition_error", None)
@@ -372,7 +565,8 @@ if wizard_step == 1:
 
 # ==================== 2단계 화면: 업로드한 사진(좌) + 식재료 확인(우) ====================
 elif wizard_step == 2:
-    photo_col, ingredient_col = st.columns(2)
+    with st.container(key="step_layout"):
+        photo_col, ingredient_col = st.columns(2)
 
     with photo_col:
         st.subheader("① 사진 업로드")
@@ -405,7 +599,8 @@ elif wizard_step == 2:
 
 # ==================== 3단계 화면: 식재료 확인(좌) + 레시피 추천(우) ====================
 elif wizard_step == 3:
-    ingredient_col, recipe_col = st.columns(2)
+    with st.container(key="step_layout"):
+        ingredient_col, recipe_col = st.columns(2)
 
     with ingredient_col:
         render_ingredient_editor()
@@ -419,7 +614,10 @@ elif wizard_step == 3:
         ingredient_names = [
             item["name"] for item in st.session_state.ingredients if item.get("name", "").strip()
         ]
-        chips_html = "".join(f'<span class="ingredient-chip">{name}</span>' for name in ingredient_names)
+        # 재료 이름은 AI 응답이나 사용자 입력이라 HTML로 해석되지 않게 이스케이프한다.
+        chips_html = "".join(
+            f'<span class="ingredient-chip">{html.escape(name)}</span>' for name in ingredient_names
+        )
         st.markdown(chips_html or "_재료를 먼저 추가해주세요._", unsafe_allow_html=True)
 
         # 이번 세션에서 처음 진입한 경우, 프로필에 저장된 기본 조건을 초깃값으로 채운다.
@@ -438,7 +636,8 @@ elif wizard_step == 3:
             st.session_state.recipe_time = _default(saved and saved.get("default_time"), TIME_OPTIONS)
             st.session_state.recipe_servings = _default(saved and saved.get("default_servings"), SERVINGS_OPTIONS)
 
-        opt_cols = st.columns(4)
+        with st.container(key="recipe_options"):
+            opt_cols = st.columns(4)
         cuisine = opt_cols[0].selectbox("요리 종류", CUISINE_OPTIONS, key="recipe_cuisine")
         difficulty = opt_cols[1].selectbox("난이도", DIFFICULTY_OPTIONS, key="recipe_difficulty")
         time_pref = opt_cols[2].selectbox("조리 시간", TIME_OPTIONS, key="recipe_time")
@@ -455,7 +654,13 @@ elif wizard_step == 3:
         elapsed = now - last_request
         can_request = elapsed >= RECIPE_REQUEST_COOLDOWN_SECONDS
 
-        button_label = "다시 추천받기" if "recipes" in st.session_state else "레시피 생성하기"
+        recipe_error = st.session_state.get("recipe_error")
+        if recipe_error:
+            button_label = "다시 시도하기"
+        else:
+            button_label = "다시 추천받기" if "recipes" in st.session_state else "레시피 생성하기"
+        # 오류 안내는 단추 위에 보이게 하되, 다시 시도하는 동안에는 이전 오류를 그리지 않는다.
+        error_slot = st.container()
         if not can_request:
             st.caption(f"{RECIPE_REQUEST_COOLDOWN_SECONDS - elapsed:.0f}초 후 다시 시도할 수 있습니다.")
 
@@ -474,7 +679,11 @@ elif wizard_step == 3:
 
         if manual_click:
             st.session_state.last_recipe_request_time = time.time()
-            with st.status("레시피를 생성하는 중입니다...", expanded=True) as status:
+            st.session_state.pop("recipe_error", None)
+            st.session_state.pop("recipe_error_detail", None)
+            error, detail, response = None, None, None
+            with st.status(f"레시피를 생성하는 중입니다. {RECIPE_WAIT_NOTICE}", expanded=True) as status:
+                status.write(RETRY_NOTICE)
                 try:
                     response, used_recipe_model = generate_recipes(
                         ingredient_names,
@@ -484,77 +693,71 @@ elif wizard_step == 3:
                         **recipe_options,
                     )
                 except requests.exceptions.Timeout:
-                    status.update(label="생성 실패", state="error")
-                    st.session_state.pop("recipes", None)
-                    st.session_state.pop("selected_recipe", None)
-                    st.error("❌ 레시피 생성 실패: 요청이 시간 초과되었습니다. 잠시 후 다시 시도해주세요.")
-                    st.stop()
+                    error = TIMEOUT_MESSAGE.format(action="레시피 생성")
                 except requests.exceptions.RequestException as e:
+                    error, detail = NETWORK_MESSAGE.format(action="레시피 생성"), str(e)
+                if response is None:
                     status.update(label="생성 실패", state="error")
-                    st.session_state.pop("recipes", None)
-                    st.session_state.pop("selected_recipe", None)
-                    st.error(f"❌ 레시피 생성 실패: 네트워크 오류가 발생했습니다: {e}")
-                    st.stop()
-                status.update(label="생성 완료", state="complete")
-
-            st.session_state.used_recipe_model = used_recipe_model
-
-            if response.status_code == 429:
-                st.session_state.pop("recipes", None)
-                st.session_state.pop("selected_recipe", None)
-                st.error(rate_limit_message(response, "레시피 생성"))
-                with st.expander("자세히 보기 (기술 정보)"):
-                    st.code(response.text)
-            elif response.status_code in PERMANENT_ERROR_STATUSES:
-                st.session_state.pop("recipes", None)
-                st.session_state.pop("selected_recipe", None)
-                st.error(f"❌ 레시피 생성 실패: API 키나 크레딧을 확인해 주세요 (status {response.status_code}).")
-                with st.expander("자세히 보기 (기술 정보)"):
-                    st.code(response.text)
-            elif response.status_code >= 500:
-                st.session_state.pop("recipes", None)
-                st.session_state.pop("selected_recipe", None)
-                st.error("❌ 레시피 생성 실패: 모델 제공자 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
-            elif response.status_code != 200:
-                st.session_state.pop("recipes", None)
-                st.session_state.pop("selected_recipe", None)
-                st.error(f"❌ 레시피 생성 실패: 요청이 실패했습니다 (status {response.status_code}).")
-                with st.expander("자세히 보기 (기술 정보)"):
-                    st.code(response.text)
-            else:
-                content = extract_content(response)
-                if content is None:
-                    st.session_state.pop("recipes", None)
-                    st.session_state.pop("selected_recipe", None)
-                    st.error("❌ 레시피 생성 실패: 모델 응답 형식이 올바르지 않습니다 (응답 내용 없음). 잠시 후 다시 시도해주세요.")
-                    with st.expander("자세히 보기 (기술 정보)"):
-                        st.code(response.text)
                 else:
-                    recipes = parse_recipes(content)
-                    if not recipes:
-                        st.session_state.pop("recipes", None)
-                        st.session_state.pop("selected_recipe", None)
-                        st.error("❌ 레시피 생성 실패: 서로 다른 모델 3차 시도 모두 응답을 레시피로 변환하지 못했습니다.")
-                        with st.expander("자세히 보기 (기술 정보)"):
-                            st.code(content)
+                    status.update(label="생성 완료", state="complete")
+
+            if response is not None:
+                st.session_state.used_recipe_model = used_recipe_model
+                if response.status_code != 200:
+                    error, detail = http_failure_message(response, "레시피 생성")
+                else:
+                    content = extract_content(response)
+                    recipes = parse_recipes(content) if content is not None else None
+                    if content is None:
+                        error, detail = EMPTY_RESPONSE_MESSAGE.format(action="레시피 생성"), response.text
+                    elif not recipes:
+                        error = (
+                            "❌ 레시피 생성 실패: AI 응답을 레시피로 바꾸지 못했습니다. "
+                            "다시 시도하면 다른 응답을 받을 수 있어요."
+                        )
+                        detail = content
+                    elif not _is_korean_enough(recipes):
+                        # generate_recipes는 끝까지 한국어 응답을 못 받으면 마지막 응답을 그대로 돌려준다.
+                        error = (
+                            "❌ 레시피 생성 실패: 한국어 레시피를 받지 못했습니다. AI가 다른 언어로 답했어요. "
+                            "잠시 후 다시 시도해 주세요."
+                        )
+                        detail = content
                     else:
                         st.session_state.recipes = recipes
                         st.session_state.selected_recipe = 0
-                        # 인디케이터(③ 레시피 추천)는 화면 상단, 이 성공 처리보다 먼저 그려진다.
-                        # 여기서 즉시 rerun해야 인디케이터가 방금 세팅된 recipes를 반영해 체크 표시로 바뀐다.
-                        st.rerun()
+            if error:
+                st.session_state.pop("recipes", None)
+                st.session_state.pop("selected_recipe", None)
+                st.session_state.recipe_error = error
+                st.session_state.recipe_error_detail = detail
+            # 실패가 빨리 끝났으면 재요청 대기 시간이 지날 때까지 기다렸다가 다시 그린다.
+            # 그러지 않으면 단추가 비활성인 채로 남아, 다른 곳을 누르기 전까지 다시 시도할 수 없다.
+            remaining = RECIPE_REQUEST_COOLDOWN_SECONDS - (time.time() - st.session_state.last_recipe_request_time)
+            if remaining > 0:
+                time.sleep(remaining)
+            # 인디케이터(③ 레시피 추천)는 화면 상단, 이 처리보다 먼저 그려진다.
+            # 즉시 rerun해야 인디케이터와 오류 안내가 방금 바뀐 상태를 반영한다.
+            st.rerun()
+
+        if recipe_error:
+            with error_slot:
+                show_error(recipe_error, st.session_state.get("recipe_error_detail"))
+        elif "recipes" not in st.session_state:
+            st.caption(f"⏱ 레시피 생성에는 {RECIPE_WAIT_NOTICE}")
 
         if st.session_state.get("used_recipe_model"):
             st.caption(f"실제 응답 모델: `{st.session_state.used_recipe_model}`")
 
         if st.session_state.get("recipes"):
             st.caption("💡 매 요청마다 다른 레시피가 나올 수 있어요. 마음에 안 들면 다시 추천받아보세요.")
-            cols = st.columns(len(st.session_state.recipes))
+            with st.container(key="recipe_cards"):
+                cols = st.columns(len(st.session_state.recipes))
             for idx, (col, r) in enumerate(zip(cols, st.session_state.recipes)):
                 with col:
                     with st.container(border=True, height=260):
                         st.markdown(f"**{r.get('name', '이름 없음')}**")
-                        st.write(f"⏱ 약 {r.get('cook_time_minutes', '?')}분")
+                        st.write(cook_time_text(r.get("cook_time_minutes")))
                         missing = r.get("missing_ingredients") or []
                         if missing:
                             st.warning("부족: " + ", ".join(missing))
@@ -567,7 +770,8 @@ elif wizard_step == 3:
             if selected_idx is not None and 0 <= selected_idx < len(st.session_state.recipes):
                 recipe = st.session_state.recipes[selected_idx]
                 st.divider()
-                detail_header_col, detail_back_col = st.columns([4, 1])
+                with st.container(key="recipe_detail_header"):
+                    detail_header_col, detail_back_col = st.columns([4, 1])
                 detail_header_col.markdown(f"### 📖 {recipe.get('name', '이름 없음')}")
                 if detail_back_col.button("← 목록으로"):
                     st.session_state.pop("selected_recipe", None)
