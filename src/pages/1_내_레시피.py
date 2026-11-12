@@ -16,7 +16,10 @@ if not user:
 recipes = db.list_recipes(user["id"])
 
 if not recipes:
-    st.info("아직 저장한 레시피가 없습니다. 2단계 레시피 상세 화면에서 '레시피 저장'을 눌러보세요.")
+    st.info(
+        "아직 저장한 레시피가 없습니다. 메인 화면의 '③ 레시피 추천'에서 레시피의 '자세히 보기'를 누른 뒤 "
+        "'레시피 저장'을 눌러 주세요."
+    )
 else:
     delete_target = None
     for recipe in recipes:
@@ -25,7 +28,8 @@ else:
             with col_main:
                 st.markdown(f"### {recipe['name']}")
                 st.caption(f"저장 시각: {recipe['saved_at']}")
-                st.write(f"⏱ 약 {recipe.get('cook_time_minutes', '?')}분")
+                minutes = recipe.get("cook_time_minutes")
+                st.write(f"⏱ 약 {minutes}분" if minutes is not None else "⏱ 조리 시간 정보 없음")
                 st.write("**사용 재료**: " + ", ".join(recipe["used_ingredients"]))
                 if recipe["missing_ingredients"]:
                     st.write("**추가로 필요한 재료**: " + ", ".join(recipe["missing_ingredients"]))

@@ -44,6 +44,11 @@ st.subheader("🍳 레시피 추천 기본값")
 st.caption("여기서 설정한 값이 레시피 추천 화면(3단계)의 기본 선택값으로 채워집니다. 그 화면에서 매번 다시 바꿀 수 있습니다.")
 
 saved = db.get_user_by_id(user["id"])
+if not saved:
+    # 계정이 DB에서 지워진 경우 등. 로그인 상태를 비우고 다시 로그인하도록 안내한다.
+    st.session_state.pop("current_user", None)
+    st.warning("계정 정보를 찾을 수 없어 로그아웃했습니다. 왼쪽 사이드바에서 다시 로그인해 주세요.")
+    st.stop()
 
 
 def _index(saved_value, options):

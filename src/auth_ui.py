@@ -1,9 +1,13 @@
+import logging
+
 import streamlit as st
 
 import auth
 import db
 
 db.init_db()
+
+logger = logging.getLogger(__name__)
 
 # app.py의 진행 상태 키. 로그아웃 시 이전 화면(재료 목록/레시피 등)이
 # 남아있지 않도록 함께 지운다. app.py에서 새 session_state 키를 추가하면 여기도 갱신해야 한다.
@@ -17,6 +21,8 @@ APP_FLOW_STATE_KEYS = [
     "used_vision_model",
     "recipes",
     "selected_recipe",
+    "recipe_error",
+    "recipe_error_detail",
     "last_recipe_request_time",
     "recipe_cuisine",
     "recipe_difficulty",
@@ -93,10 +99,10 @@ def render_sidebar_auth():
             if st.button("Google로 로그인", key="google_login_button"):
                 try:
                     st.login()
-                except Exception as e:
+                except Exception:
+                    # 예외 문구에 내부 설정 이름이나 주소가 섞일 수 있어 화면에는 보이지 않고 서버 로그에만 남긴다.
+                    logger.exception("Google 로그인 시작 실패")
                     st.error("Google 로그인을 사용할 수 없습니다. 잠시 후 다시 시도하거나 이메일로 로그인해주세요.")
-                    with st.expander("자세히 보기 (기술 정보)"):
-                        st.code(str(e))
 
             st.divider()
 
